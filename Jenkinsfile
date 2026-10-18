@@ -1,28 +1,45 @@
+
 pipeline {
     agent any
 
     options {
         timestamps()
-        disableConcurrentBuilds()
         timeout(time: 20, unit: 'MINUTES')
-        buildDiscarder(logRotator(numToKeepStr: '20'))
-    }
-
-    triggers {
-        githubPush()
+        disableConcurrentBuilds()
     }
 
     parameters {
-        string(name: 'DOCKERHUB_NAMESPACE', defaultValue: '', description: 'Docker Hub username or organization (required)')
-        string(name: 'IMAGE_NAME', defaultValue: 'jenkins-kubernetes-cicd-demo', description: 'Docker Hub repository/image name')
-        string(name: 'K8S_NAMESPACE', defaultValue: 'cicd-demo', description: 'Kubernetes namespace')
-        string(name: 'K8S_DEPLOYMENT', defaultValue: 'cicd-demo', description: 'Kubernetes Deployment name')
-        string(name: 'K8S_CONTAINER', defaultValue: 'app', description: 'Container name in the Deployment')
+        string(
+            name: 'DOCKERHUB_NAMESPACE',
+            defaultValue: '',
+            description: 'Docker Hub username or organization (required)'
+        )
+        string(
+            name: 'IMAGE_NAME',
+            defaultValue: 'jenkins-kubernetes-cicd-demo',
+            description: 'Docker Hub repository/image name'
+        )
+        string(
+            name: 'K8S_NAMESPACE',
+            defaultValue: 'cicd-demo',
+            description: 'Kubernetes namespace'
+        )
+        string(
+            name: 'K8S_DEPLOYMENT',
+            defaultValue: 'cicd-demo',
+            description: 'Kubernetes Deployment name'
+        )
+        string(
+            name: 'K8S_CONTAINER',
+            defaultValue: 'app',
+            description: 'Container name in the Deployment'
+        )
     }
 
     environment {
         REGISTRY_CREDENTIALS = 'dockerhub-creds'
         KUBECONFIG_CREDENTIAL = 'kubeconfig'
+        REGISTRY_HOST = 'docker.io'
         APP_PORT = '8081'
     }
 
@@ -30,14 +47,36 @@ pipeline {
         stage('Validate Configuration') {
             steps {
                 script {
-                    if (!params.DOCKERHUB_NAMESPACE?.trim()) {
-                        error('Set DOCKERHUB_NAMESPACE to your Docker Hub username or organization.')
+                    env.DOCKERHUB_NAMESPACE =
+                        params.DOCKERHUB_NAMESPACE.trim()
+                    env.IMAGE_NAME = params.IMAGE_NAME.trim()
+                    env.K8S_NAMESPACE = params.K8S_NAMESPACE.trim()
+                    env.K8S_DEPLOYMENT = params.K8S_DEPLOYMENT.trim()
+                    env.K8S_CONTAINER = params.K8S_CONTAINER.trim()
+
+                    if (!env.DOCKERHUB_NAMESPACE ||
+                        !env.IMAGE_NAME ||
+                        !env.K8S_NAMESPACE ||
+                        !env.K8S_DEPLOYMENT ||
+                        !env.K8S_CONTAINER) {
+                        error('Required build parameters cannot be empty.')
                     }
-                    if (!(params.IMAGE_NAME ==~ /[a-z0-9]+([._-][a-z0-9]+)*/)) {
-                        error('IMAGE_NAME must contain lowercase letters, digits, dots, underscores, or hyphens.')
+
+                    if (!(env.IMAGE_NAME ==~ /[a-z0-9]+([._-][a-z0-9]+)*/)) {
+                        error('IMAGE_NAME contains invalid characters.')
                     }
-                    env.IMAGE_REPOSITORY = "${params.DOCKERHUB_NAMESPACE.trim()}/${params.IMAGE_NAME}"
+
+                    env.IMAGE_TAG = sh(
+                        script: 'git rev-parse --short=12 HEAD',
+                        returnStdout: true
+                    ).trim()
+
+                    env.FULL_IMAGE =
+                        "${env.DOCKERHUB_NAMESPACE}/${env.IMAGE_NAME}:${env.IMAGE_TAG}"
+
+                    echo "Building ${env.FULL_IMAGE}"
                 }
+
                 sh '''
                     set -eu
                     command -v git
@@ -52,12 +91,14 @@ pipeline {
             steps {
                 checkout scm
                 script {
-                    env.GIT_SHA = sh(
+                    env.IMAGE_TAG = sh(
                         script: 'git rev-parse --short=12 HEAD',
                         returnStdout: true
                     ).trim()
-                    env.IMAGE_TAG = env.GIT_SHA
-                    env.FULL_IMAGE = "${env.IMAGE_REPOSITORY}:${env.IMAGE_TAG}"
+
+                    env.FULL_IMAGE =
+                        "${env.DOCKERHUB_NAMESPACE}/${env.IMAGE_NAME}:${env.IMAGE_TAG}"
+
                     echo "Building ${env.FULL_IMAGE}"
                 }
             }
@@ -74,10 +115,21 @@ pipeline {
 
         stage('Build Image') {
             steps {
-                sh '''
-                    set -eu
-                    docker build --pull -t "$FULL_IMAGE" .
-                '''
+                withCredentials([usernamePassword(
+                    credentialsId: "${env.REGISTRY_CREDENTIALS}",
+                    usernameVariable: 'DOCKERHUB_USER',
+                    passwordVariable: 'DOCKERHUB_TOKEN'
+                )]) {
+                    sh '''
+                        set -eu
+                        set +x
+
+                        printf '%s' "$DOCKERHUB_TOKEN" | docker login \
+                          --username "$DOCKERHUB_USER" --password-stdin
+
+                        docker build --pull -t "$FULL_IMAGE" .
+                    '''
+                }
             }
         }
 
@@ -89,10 +141,12 @@ pipeline {
                     passwordVariable: 'DOCKERHUB_TOKEN'
                 )]) {
                     sh '''
+                        set -eu
                         set +x
+
                         printf '%s' "$DOCKERHUB_TOKEN" | docker login \
                           --username "$DOCKERHUB_USER" --password-stdin
-                        set -eu
+
                         docker push "$FULL_IMAGE"
                         docker logout
                     '''
@@ -122,9 +176,8 @@ pipeline {
 
                         kubectl rollout status \
                           "deployment/$K8S_DEPLOYMENT" \
-                          -n "$K8S_NAMESPACE" --timeout=180s
-
-                        kubectl get deployment,pods,services -n "$K8S_NAMESPACE"
+                          -n "$K8S_NAMESPACE" \
+                          --timeout=180s
                     '''
                 }
             }
@@ -139,8 +192,12 @@ pipeline {
                     sh '''
                         set -eu
                         export KUBECONFIG="$KUBECONFIG_FILE"
-                        kubectl get deployment "$K8S_DEPLOYMENT" -n "$K8S_NAMESPACE" \
-                          -o jsonpath='{.status.availableReplicas}' | grep -E '^[1-9][0-9]*$'
+
+                        kubectl get deployment "$K8S_DEPLOYMENT" \
+                          -n "$K8S_NAMESPACE" \
+                          -o jsonpath='{.status.availableReplicas}' \
+                          | grep -E '^[1-9][0-9]*$'
+
                         echo "Deployment has at least one available replica."
                     '''
                 }
@@ -150,13 +207,16 @@ pipeline {
 
     post {
         success {
-            echo "CI/CD succeeded: ${env.FULL_IMAGE ?: 'image not resolved'}"
+            echo "CI/CD pipeline completed successfully: ${env.FULL_IMAGE}"
         }
+
         failure {
-            echo 'CI/CD failed. Review the first failed stage and its console output.'
+            echo "Build #${env.BUILD_NUMBER} failed. Review the first failed stage and its console output."
         }
+
         always {
             echo "Build #${env.BUILD_NUMBER} result: ${currentBuild.currentResult}"
         }
     }
 }
+
